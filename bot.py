@@ -146,6 +146,15 @@ async def main() -> None:
             f"for '{KEYWORD}' (whole word, case-insensitive)."
         )
 
+        # Optional one-shot test blast on startup. Set TEST_BLAST=1 in Railway to trigger,
+        # then DELETE the var to disable.
+        if os.environ.get("TEST_BLAST") == "1":
+            log(f"TEST_BLAST=1 → firing test blast of {ALARM_BLAST_COUNT} messages")
+            telegram_send(f"🧪 TEST BLAST — simulating a '{KEYWORD}' match from @{TARGET_USERNAME}")
+            for i in range(ALARM_BLAST_COUNT - 1):
+                telegram_send(f"🚨🚨 TEST {KEYWORD.upper()}  [{i+2}/{ALARM_BLAST_COUNT}]")
+                time.sleep(ALARM_BLAST_DELAY)
+
         consecutive_errors = 0
 
         while True:
