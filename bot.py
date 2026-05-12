@@ -38,6 +38,8 @@ X_CT0              = env("X_CT0",              required=True)
 TARGET_USERNAME    = env("TARGET_USERNAME", "kevinxu")
 KEYWORD            = env("KEYWORD",         "sold")
 POLL_INTERVAL_SEC  = int(env("POLL_INTERVAL_SEC", "10"))
+ALARM_BLAST_COUNT  = int(env("ALARM_BLAST_COUNT", "30"))   # number of Telegram pings on match
+ALARM_BLAST_DELAY  = float(env("ALARM_BLAST_DELAY", "0.3"))
 
 KEYWORD_RE = re.compile(rf"\b{re.escape(KEYWORD)}\b", re.IGNORECASE)
 
@@ -161,12 +163,16 @@ async def main() -> None:
 
                     if KEYWORD_RE.search(t["text"] or ""):
                         tweet_url = f"https://x.com/{TARGET_USERNAME}/status/{t['id']}"
-                        msg = (
-                            f"🚨 '{KEYWORD}' detected from @{TARGET_USERNAME}\n\n"
+                        full_msg = (
+                            f"🚨🚨🚨 '{KEYWORD}' DETECTED FROM @{TARGET_USERNAME} 🚨🚨🚨\n\n"
                             f"{t['text']}\n\n{tweet_url}"
                         )
-                        log(f"MATCH → telegram: {tweet_url}")
-                        telegram_send(msg)
+                        short_msg = f"🚨🚨 {KEYWORD.upper()} — {tweet_url}"
+                        log(f"MATCH → blasting {ALARM_BLAST_COUNT} telegram msgs: {tweet_url}")
+                        telegram_send(full_msg)  # first one carries full context
+                        for i in range(ALARM_BLAST_COUNT - 1):
+                            telegram_send(f"{short_msg}  [{i+2}/{ALARM_BLAST_COUNT}]")
+                            time.sleep(ALARM_BLAST_DELAY)
             except Exception as e:
                 consecutive_errors += 1
                 log(f"poll error #{consecutive_errors}: {e!r}")
