@@ -1,1 +1,2 @@
-twikit>=2.0.0
+# Playwright is pre-installed in the Docker base image (mcr.microsoft.com/playwright/python).
+# No pip dependencies needed.
