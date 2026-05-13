@@ -45,12 +45,18 @@ TELEGRAM_CHAT_ID   = env("TELEGRAM_CHAT_ID",   required=True)
 X_AUTH_TOKEN       = env("X_AUTH_TOKEN",       required=True)
 X_CT0              = env("X_CT0",              required=True)
 TARGET_USERNAME    = env("TARGET_USERNAME", "kevinxu")
-KEYWORD            = env("KEYWORD",         "sold")
+KEYWORD            = env("KEYWORD",         "sold,new")   # comma-separated whole-words
 POLL_INTERVAL_SEC  = int(env("POLL_INTERVAL_SEC", "10"))
 ALARM_BLAST_COUNT  = int(env("ALARM_BLAST_COUNT", "30"))
 ALARM_BLAST_DELAY  = float(env("ALARM_BLAST_DELAY", "0.3"))
 
-KEYWORD_RE = re.compile(rf"\b{re.escape(KEYWORD)}\b", re.IGNORECASE)
+# Build an alternation regex from the comma-separated KEYWORD value.
+_keyword_list = [k.strip() for k in KEYWORD.split(",") if k.strip()]
+KEYWORD_RE = re.compile(
+    rf"\b(?:{'|'.join(re.escape(k) for k in _keyword_list)})\b",
+    re.IGNORECASE,
+)
+KEYWORD_DISPLAY = "/".join(_keyword_list)   # for messages, e.g. "sold/new"
 
 # Shared lock around the single Playwright page so polling + commands don't trample.
 page_lock = asyncio.Lock()
@@ -231,10 +237,10 @@ def blast_for_tweet(t: dict, label_prefix: str = "") -> None:
     """Send the configured blast pattern for a single matched tweet."""
     tweet_url = f"https://x.com/{TARGET_USERNAME}/status/{t['id']}"
     full_msg = (
-        f"{label_prefix}🚨🚨🚨 '{KEYWORD}' from @{TARGET_USERNAME} 🚨🚨🚨\n\n"
+        f"{label_prefix}🚨🚨🚨 '{KEYWORD_DISPLAY}' from @{TARGET_USERNAME} 🚨🚨🚨\n\n"
         f"{t.get('text','')}\n\n{tweet_url}"
     )
-    short_msg = f"🚨🚨 {KEYWORD.upper()} — {tweet_url}"
+    short_msg = f"🚨🚨 {KEYWORD_DISPLAY.upper()} — {tweet_url}"
     telegram_send(full_msg)
     for i in range(ALARM_BLAST_COUNT - 1):
         telegram_send(f"{short_msg}  [{i+2}/{ALARM_BLAST_COUNT}]")
@@ -256,7 +262,7 @@ async def cmd_test(page) -> None:
     matches = find_matches(tweets)
     if not matches:
         telegram_send(
-            f"🧪 /test — no recent '{KEYWORD}' tweet found in last {len(tweets)} "
+            f"🧪 /test — no recent '{KEYWORD_DISPLAY}' tweet found in last {len(tweets)} "
             f"tweets from @{TARGET_USERNAME}."
         )
         return
@@ -273,7 +279,7 @@ async def cmd_lastsold(page, n: int) -> None:
         if len(cached_matches) >= n:
             telegram_send(
                 f"📋 /lastsold {n} — using last poll ({int(age)}s old). "
-                f"Showing {n} most recent '{KEYWORD}' tweet(s):"
+                f"Showing {n} most recent '{KEYWORD_DISPLAY}' tweet(s):"
             )
             for m in cached_matches[:n]:
                 url = f"https://x.com/{TARGET_USERNAME}/status/{m['id']}"
@@ -287,12 +293,12 @@ async def cmd_lastsold(page, n: int) -> None:
     matches = find_matches(tweets)[:n]
     if not matches:
         telegram_send(
-            f"No tweets matching '{KEYWORD}' in the last {len(tweets)} tweets "
+            f"No tweets matching '{KEYWORD_DISPLAY}' in the last {len(tweets)} tweets "
             f"from @{TARGET_USERNAME}."
         )
         return
     telegram_send(
-        f"📋 Showing {len(matches)} most recent '{KEYWORD}' tweet(s) "
+        f"📋 Showing {len(matches)} most recent '{KEYWORD_DISPLAY}' tweet(s) "
         f"from @{TARGET_USERNAME} (scanned {len(tweets)} tweets):"
     )
     for m in matches:
@@ -305,8 +311,8 @@ async def cmd_help() -> None:
     telegram_send(
         f"Commands:\n"
         f"/test  — fire a simulated alarm using @{TARGET_USERNAME}'s most recent "
-        f"'{KEYWORD}' tweet\n"
-        f"/lastsold  — show the single most recent '{KEYWORD}' tweet\n"
+        f"'{KEYWORD_DISPLAY}' tweet\n"
+        f"/lastsold  — show the single most recent '{KEYWORD_DISPLAY}' tweet\n"
         f"/lastsold N  — show the last N matching tweets (max 100)\n"
         f"/help  — this list"
     )
@@ -441,7 +447,7 @@ async def main() -> None:
 
         telegram_send(
             f"Bot online. Watching @{TARGET_USERNAME} every {POLL_INTERVAL_SEC}s "
-            f"for '{KEYWORD}'. Commands: /test, /lastsold [N], /help"
+            f"for '{KEYWORD_DISPLAY}'. Commands: /test, /lastsold [N], /help"
         )
 
         # Run both loops concurrently. If either crashes hard, the process exits.
