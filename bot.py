@@ -55,6 +55,12 @@ KEYWORD_RE = re.compile(rf"\b{re.escape(KEYWORD)}\b", re.IGNORECASE)
 # Shared lock around the single Playwright page so polling + commands don't trample.
 page_lock = asyncio.Lock()
 
+# Cache of the most recent polling fetch, so /test and small /lastsold can piggyback
+# on the polling loop instead of triggering extra fetches (which is what trips X's throttle).
+last_poll_tweets: list = []
+last_poll_ts: float = 0.0
+CACHE_MAX_AGE_SEC = 90  # commands will reuse cache if it's fresher than this
+
 
 def log(msg: str) -> None:
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
@@ -132,6 +138,34 @@ async def fetch_tweets(page, username: str, target_count: int = 0):
     await asyncio.sleep(1.5)
     merge(await page.evaluate(JS_EXTRACT_TWEETS))
 
+    # X soft-throttle: page loads with profile header but timeline shows
+    # "Something went wrong. Try again." Click the Retry button and re-extract.
+    if not seen:
+        try:
+            body_text = await page.evaluate(
+                "() => (document.body && document.body.innerText || '')"
+            )
+            if "Something went wrong" in body_text:
+                log("X served 'Something went wrong' — clicking Retry and re-extracting")
+                try:
+                    await page.get_by_role("button", name="Retry").click(timeout=5000)
+                except Exception:
+                    # Sometimes the button is labelled "Try again" instead
+                    try:
+                        await page.get_by_text("Retry", exact=True).click(timeout=3000)
+                    except Exception:
+                        await page.get_by_text("Try again", exact=True).click(timeout=3000)
+                await asyncio.sleep(3)
+                try:
+                    await page.wait_for_selector('article[data-testid="tweet"]', timeout=15000)
+                except PWTimeout:
+                    pass
+                merge(await page.evaluate(JS_EXTRACT_TWEETS))
+                if seen:
+                    log(f"recovered after Retry: {len(seen)} tweets")
+        except Exception as e:
+            log(f"retry-on-throttle failed: {e!r}")
+
     if not seen:
         # Diagnostic dump — find out what X actually served when we got 0 tweets.
         try:
@@ -199,10 +233,14 @@ def blast_for_tweet(t: dict, label_prefix: str = "") -> None:
 # ---------------------- command handlers ----------------------
 
 async def cmd_test(page) -> None:
-    telegram_send("🧪 /test — fetching recent tweets...")
-    # Scrape ~30 tweets so /test reliably finds a recent match even if it's not in
-    # the first DOM snapshot (Kevin's "sold" tweets aren't always at the top).
-    tweets = await fetch_tweets_safe(page, TARGET_USERNAME, target_count=30)
+    # Prefer the polling-loop cache to avoid piling extra fetches on top of polls.
+    age = time.time() - last_poll_ts
+    if last_poll_tweets and age < CACHE_MAX_AGE_SEC:
+        telegram_send(f"🧪 /test — using last poll ({int(age)}s old, {len(last_poll_tweets)} tweets)")
+        tweets = last_poll_tweets
+    else:
+        telegram_send("🧪 /test — cache stale, fetching fresh...")
+        tweets = await fetch_tweets_safe(page, TARGET_USERNAME, target_count=30)
     matches = find_matches(tweets)
     if not matches:
         telegram_send(
@@ -216,8 +254,22 @@ async def cmd_test(page) -> None:
 
 async def cmd_lastsold(page, n: int) -> None:
     n = max(1, min(n, 100))
+    # Try cache first: if it already contains >= n matches, no fresh fetch needed.
+    age = time.time() - last_poll_ts
+    if last_poll_tweets and age < CACHE_MAX_AGE_SEC:
+        cached_matches = find_matches(last_poll_tweets)
+        if len(cached_matches) >= n:
+            telegram_send(
+                f"📋 /lastsold {n} — using last poll ({int(age)}s old). "
+                f"Showing {n} most recent '{KEYWORD}' tweet(s):"
+            )
+            for m in cached_matches[:n]:
+                url = f"https://x.com/{TARGET_USERNAME}/status/{m['id']}"
+                telegram_send(f"{m.get('text','')}\n\n{url}")
+                time.sleep(0.25)
+            return
+    # Cache insufficient — do a fresh deep scrape.
     telegram_send(f"📋 /lastsold {n} — scraping @{TARGET_USERNAME}'s timeline...")
-    # Fetch enough tweets to plausibly contain N matches. Heuristic: scrape 6× N.
     tweets = await fetch_tweets_safe(page, TARGET_USERNAME, target_count=max(20, n * 6))
     matches = find_matches(tweets)[:n]
     if not matches:
@@ -250,7 +302,11 @@ async def cmd_help() -> None:
 # ---------------------- background loops ----------------------
 
 async def polling_loop(page) -> None:
+    global last_poll_tweets, last_poll_ts
     tweets = await fetch_tweets_safe(page, TARGET_USERNAME)
+    if tweets:
+        last_poll_tweets = tweets
+        last_poll_ts = time.time()
     last_seen_id = max((int(t["id"]) for t in tweets), default=0)
     log(f"poll seed: last_seen_id={last_seen_id}, scanning every {POLL_INTERVAL_SEC}s")
 
@@ -261,6 +317,9 @@ async def polling_loop(page) -> None:
         try:
             tweets = await fetch_tweets_safe(page, TARGET_USERNAME)
             consecutive_errors = 0
+            if tweets:
+                last_poll_tweets = tweets
+                last_poll_ts = time.time()
 
             # Silent-failure detection: 0 tweets returned probably means cookies
             # expired / X served a login wall / account locked.
