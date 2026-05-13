@@ -61,6 +61,10 @@ last_poll_tweets: list = []
 last_poll_ts: float = 0.0
 CACHE_MAX_AGE_SEC = 90  # commands will reuse cache if it's fresher than this
 
+# Exponential backoff on throttle. When X serves "Something went wrong" we'll
+# pause this many seconds before the next request, doubling each consecutive hit.
+throttle_backoff_sec: float = 0.0
+
 
 def log(msg: str) -> None:
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
@@ -119,12 +123,20 @@ async def fetch_tweets(page, username: str, target_count: int = 0):
     On empty result, logs a diagnostic dump (URL, title, body snippet) so we can
     see what X actually served instead of a timeline.
     """
+    global throttle_backoff_sec
+
     seen: dict[str, dict] = {}
 
     def merge(batch):
         for t in batch:
             if t.get("id"):
                 seen[t["id"]] = t
+
+    # If a previous fetch saw a throttle, honour an exponential cooldown before
+    # touching x.com again. This prevents the bot from compounding the throttle.
+    if throttle_backoff_sec > 0:
+        log(f"throttle cooldown — sleeping {throttle_backoff_sec:.0f}s before fetch")
+        await asyncio.sleep(throttle_backoff_sec)
 
     await page.goto(
         f"https://x.com/{username}",
@@ -139,32 +151,31 @@ async def fetch_tweets(page, username: str, target_count: int = 0):
     merge(await page.evaluate(JS_EXTRACT_TWEETS))
 
     # X soft-throttle: page loads with profile header but timeline shows
-    # "Something went wrong. Try again." Click the Retry button and re-extract.
+    # "Something went wrong." Bump the cooldown so the NEXT fetch waits, but
+    # don't try to recover this fetch — clicking Retry just re-hits the throttled
+    # endpoint and makes things worse.
     if not seen:
         try:
             body_text = await page.evaluate(
                 "() => (document.body && document.body.innerText || '')"
             )
             if "Something went wrong" in body_text:
-                log("X served 'Something went wrong' — clicking Retry and re-extracting")
-                try:
-                    await page.get_by_role("button", name="Retry").click(timeout=5000)
-                except Exception:
-                    # Sometimes the button is labelled "Try again" instead
-                    try:
-                        await page.get_by_text("Retry", exact=True).click(timeout=3000)
-                    except Exception:
-                        await page.get_by_text("Try again", exact=True).click(timeout=3000)
-                await asyncio.sleep(3)
-                try:
-                    await page.wait_for_selector('article[data-testid="tweet"]', timeout=15000)
-                except PWTimeout:
-                    pass
-                merge(await page.evaluate(JS_EXTRACT_TWEETS))
-                if seen:
-                    log(f"recovered after Retry: {len(seen)} tweets")
+                # Exponential backoff: 30s → 60s → 120s → 300s (capped)
+                throttle_backoff_sec = min(
+                    300.0,
+                    max(30.0, throttle_backoff_sec * 2) if throttle_backoff_sec else 30.0,
+                )
+                log(
+                    f"X throttle detected; backing off {throttle_backoff_sec:.0f}s "
+                    f"before next fetch"
+                )
         except Exception as e:
-            log(f"retry-on-throttle failed: {e!r}")
+            log(f"throttle detection failed: {e!r}")
+    else:
+        # Successful fetch — reset the cooldown.
+        if throttle_backoff_sec > 0:
+            log(f"throttle cleared; resetting backoff")
+        throttle_backoff_sec = 0.0
 
     if not seen:
         # Diagnostic dump — find out what X actually served when we got 0 tweets.
