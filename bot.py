@@ -10,9 +10,18 @@ Env vars:
   TARGET_USERNAME     (optional)  - default 'kevinxu'
   KEYWORD             (optional)  - default 'sold' (whole word, case-insensitive)
   POLL_INTERVAL_SEC   (optional)  - default '10'
+  ALARM_BLAST_COUNT   (optional)  - default '30'
+  ALARM_BLAST_DELAY   (optional)  - default '0.3'
+
+Telegram commands (send to your bot chat):
+  /test           — fire a simulated blast using the most recent matching tweet
+  /lastsold       — show the single most recent matching tweet (no blast)
+  /lastsold N     — show the last N matching tweets (max 20, no blast)
+  /help           — show this list
 """
 
 import asyncio
+import json
 import os
 import re
 import sys
@@ -38,10 +47,13 @@ X_CT0              = env("X_CT0",              required=True)
 TARGET_USERNAME    = env("TARGET_USERNAME", "kevinxu")
 KEYWORD            = env("KEYWORD",         "sold")
 POLL_INTERVAL_SEC  = int(env("POLL_INTERVAL_SEC", "10"))
-ALARM_BLAST_COUNT  = int(env("ALARM_BLAST_COUNT", "30"))   # number of Telegram pings on match
+ALARM_BLAST_COUNT  = int(env("ALARM_BLAST_COUNT", "30"))
 ALARM_BLAST_DELAY  = float(env("ALARM_BLAST_DELAY", "0.3"))
 
 KEYWORD_RE = re.compile(rf"\b{re.escape(KEYWORD)}\b", re.IGNORECASE)
+
+# Shared lock around the single Playwright page so polling + commands don't trample.
+page_lock = asyncio.Lock()
 
 
 def log(msg: str) -> None:
@@ -62,6 +74,14 @@ def telegram_send(text: str) -> None:
             r.read()
     except Exception as e:
         log(f"telegram send error: {e!r}")
+
+
+def telegram_get_updates_sync(offset: int, timeout: int = 25):
+    """Blocking long-poll. Call via run_in_executor from async code."""
+    params = urllib.parse.urlencode({"offset": offset, "timeout": timeout})
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates?{params}"
+    with urllib.request.urlopen(url, timeout=timeout + 10) as r:
+        return json.loads(r.read())
 
 
 JS_EXTRACT_TWEETS = """
@@ -85,22 +105,194 @@ JS_EXTRACT_TWEETS = """
 """
 
 
-async def fetch_tweets(page, username: str):
-    """Reload the profile page and extract visible tweets as [{id, text}, ...]."""
+async def fetch_tweets(page, username: str, target_count: int = 0):
+    """
+    Reload the profile page and extract visible tweets as [{id, text}, ...].
+    If target_count > 0, scroll the page until at least that many tweets are
+    loaded (or scrolling stops yielding new ones).
+    """
     await page.goto(
         f"https://x.com/{username}",
         wait_until="domcontentloaded",
         timeout=30000,
     )
-    # Wait until at least one tweet article is in the DOM (or timeout)
     try:
         await page.wait_for_selector('article[data-testid="tweet"]', timeout=20000)
     except PWTimeout:
         log("warning: no tweet articles appeared within 20s")
-    # Small extra wait for additional tweets to render
-    await asyncio.sleep(1.5)
-    return await page.evaluate(JS_EXTRACT_TWEETS)
+    await asyncio.sleep(1.2)
 
+    tweets = await page.evaluate(JS_EXTRACT_TWEETS)
+    if target_count <= len(tweets):
+        return tweets
+
+    last_count = len(tweets)
+    stable = 0
+    for _ in range(40):  # up to 40 scrolls
+        await page.evaluate("window.scrollBy(0, 2500)")
+        await asyncio.sleep(1.0)
+        tweets = await page.evaluate(JS_EXTRACT_TWEETS)
+        if len(tweets) >= target_count:
+            break
+        if len(tweets) == last_count:
+            stable += 1
+            if stable >= 3:
+                break
+        else:
+            stable = 0
+            last_count = len(tweets)
+    return tweets
+
+
+async def fetch_tweets_safe(page, username: str, target_count: int = 0):
+    async with page_lock:
+        return await fetch_tweets(page, username, target_count)
+
+
+def find_matches(tweets):
+    """Filter tweets by KEYWORD_RE, return list sorted newest-first by id."""
+    matches = [t for t in tweets if KEYWORD_RE.search(t.get("text") or "")]
+    matches.sort(key=lambda t: int(t["id"]), reverse=True)
+    return matches
+
+
+def blast_for_tweet(t: dict, label_prefix: str = "") -> None:
+    """Send the configured blast pattern for a single matched tweet."""
+    tweet_url = f"https://x.com/{TARGET_USERNAME}/status/{t['id']}"
+    full_msg = (
+        f"{label_prefix}🚨🚨🚨 '{KEYWORD}' from @{TARGET_USERNAME} 🚨🚨🚨\n\n"
+        f"{t.get('text','')}\n\n{tweet_url}"
+    )
+    short_msg = f"🚨🚨 {KEYWORD.upper()} — {tweet_url}"
+    telegram_send(full_msg)
+    for i in range(ALARM_BLAST_COUNT - 1):
+        telegram_send(f"{short_msg}  [{i+2}/{ALARM_BLAST_COUNT}]")
+        time.sleep(ALARM_BLAST_DELAY)
+
+
+# ---------------------- command handlers ----------------------
+
+async def cmd_test(page) -> None:
+    telegram_send("🧪 /test — fetching recent tweets...")
+    tweets = await fetch_tweets_safe(page, TARGET_USERNAME)
+    matches = find_matches(tweets)
+    if not matches:
+        telegram_send(
+            f"🧪 /test — no recent '{KEYWORD}' tweet found in last {len(tweets)} "
+            f"tweets from @{TARGET_USERNAME}."
+        )
+        return
+    log(f"/test → blasting tweet {matches[0]['id']}")
+    blast_for_tweet(matches[0], label_prefix="🧪 TEST — ")
+
+
+async def cmd_lastsold(page, n: int) -> None:
+    n = max(1, min(n, 100))
+    telegram_send(f"📋 /lastsold {n} — scraping @{TARGET_USERNAME}'s timeline...")
+    # Fetch enough tweets to plausibly contain N matches. Heuristic: scrape 6× N.
+    tweets = await fetch_tweets_safe(page, TARGET_USERNAME, target_count=max(20, n * 6))
+    matches = find_matches(tweets)[:n]
+    if not matches:
+        telegram_send(
+            f"No tweets matching '{KEYWORD}' in the last {len(tweets)} tweets "
+            f"from @{TARGET_USERNAME}."
+        )
+        return
+    telegram_send(
+        f"📋 Showing {len(matches)} most recent '{KEYWORD}' tweet(s) "
+        f"from @{TARGET_USERNAME} (scanned {len(tweets)} tweets):"
+    )
+    for m in matches:
+        url = f"https://x.com/{TARGET_USERNAME}/status/{m['id']}"
+        telegram_send(f"{m.get('text','')}\n\n{url}")
+        time.sleep(0.25)
+
+
+async def cmd_help() -> None:
+    telegram_send(
+        f"Commands:\n"
+        f"/test  — fire a simulated alarm using @{TARGET_USERNAME}'s most recent "
+        f"'{KEYWORD}' tweet\n"
+        f"/lastsold  — show the single most recent '{KEYWORD}' tweet\n"
+        f"/lastsold N  — show the last N matching tweets (max 20)\n"
+        f"/help  — this list"
+    )
+
+
+# ---------------------- background loops ----------------------
+
+async def polling_loop(page) -> None:
+    tweets = await fetch_tweets_safe(page, TARGET_USERNAME)
+    last_seen_id = max((int(t["id"]) for t in tweets), default=0)
+    log(f"poll seed: last_seen_id={last_seen_id}, scanning every {POLL_INTERVAL_SEC}s")
+
+    consecutive_errors = 0
+    while True:
+        try:
+            tweets = await fetch_tweets_safe(page, TARGET_USERNAME)
+            consecutive_errors = 0
+
+            new_tweets = [t for t in tweets if int(t["id"]) > last_seen_id]
+            new_tweets.sort(key=lambda t: int(t["id"]))
+
+            for t in new_tweets:
+                last_seen_id = max(last_seen_id, int(t["id"]))
+                preview = (t["text"] or "").replace("\n", " ")[:120]
+                log(f"new tweet {t['id']}: {preview}")
+                if KEYWORD_RE.search(t["text"] or ""):
+                    log(f"MATCH → blasting {ALARM_BLAST_COUNT} msgs for {t['id']}")
+                    blast_for_tweet(t)
+        except Exception as e:
+            consecutive_errors += 1
+            log(f"poll error #{consecutive_errors}: {e!r}")
+            if consecutive_errors == 5:
+                telegram_send(f"⚠️ Bot is hitting errors talking to X: {e!r}. Will keep retrying.")
+            if consecutive_errors >= 60:
+                telegram_send("❌ Bot giving up after 60 consecutive errors.")
+                sys.exit(1)
+
+        await asyncio.sleep(POLL_INTERVAL_SEC)
+
+
+async def command_listener(page) -> None:
+    offset = 0
+    loop = asyncio.get_event_loop()
+    log("command listener started (long-polling Telegram)")
+    while True:
+        try:
+            resp = await loop.run_in_executor(None, telegram_get_updates_sync, offset, 25)
+            if not resp.get("ok"):
+                log(f"getUpdates not ok: {resp}")
+                await asyncio.sleep(3)
+                continue
+            for update in resp.get("result", []):
+                offset = update["update_id"] + 1
+                msg = update.get("message") or update.get("channel_post") or {}
+                text = (msg.get("text") or "").strip()
+                chat_id = str((msg.get("chat") or {}).get("id", ""))
+                if not text:
+                    continue
+                if chat_id != TELEGRAM_CHAT_ID:
+                    log(f"ignoring command from unauthorized chat {chat_id}")
+                    continue
+                cmd_lower = text.lower()
+                log(f"cmd: {text}")
+                if cmd_lower.startswith("/test"):
+                    asyncio.create_task(cmd_test(page))
+                elif cmd_lower.startswith("/lastsold") or cmd_lower.startswith("/recentsold"):
+                    parts = text.split()
+                    n = 1
+                    if len(parts) > 1 and parts[1].isdigit():
+                        n = int(parts[1])
+                    asyncio.create_task(cmd_lastsold(page, n))
+                elif cmd_lower.startswith("/help") or cmd_lower.startswith("/start"):
+                    asyncio.create_task(cmd_help())
+        except Exception as e:
+            log(f"command listener error: {e!r}")
+            await asyncio.sleep(5)
+
+
+# ---------------------- main ----------------------
 
 async def main() -> None:
     async with async_playwright() as p:
@@ -117,104 +309,25 @@ async def main() -> None:
             viewport={"width": 1280, "height": 900},
         )
         await context.add_cookies([
-            {
-                "name": "auth_token", "value": X_AUTH_TOKEN,
-                "domain": ".x.com", "path": "/",
-                "httpOnly": True, "secure": True, "sameSite": "None",
-            },
-            {
-                "name": "ct0", "value": X_CT0,
-                "domain": ".x.com", "path": "/",
-                "httpOnly": False, "secure": True, "sameSite": "Lax",
-            },
+            {"name": "auth_token", "value": X_AUTH_TOKEN,
+             "domain": ".x.com", "path": "/",
+             "httpOnly": True, "secure": True, "sameSite": "None"},
+            {"name": "ct0", "value": X_CT0,
+             "domain": ".x.com", "path": "/",
+             "httpOnly": False, "secure": True, "sameSite": "Lax"},
         ])
         page = await context.new_page()
 
-        log(f"loading @{TARGET_USERNAME} for seed...")
-        tweets = await fetch_tweets(page, TARGET_USERNAME)
-        log(f"found {len(tweets)} tweets on initial load")
-        if not tweets:
-            telegram_send(
-                "Bot started but couldn't read any tweets — cookies may be invalid "
-                "or X rendered a login page. Check Railway logs."
-            )
-        last_seen_id = max((int(t["id"]) for t in tweets), default=0)
-        log(f"seeded last_seen_id={last_seen_id}, watching every {POLL_INTERVAL_SEC}s")
-
         telegram_send(
             f"Bot online. Watching @{TARGET_USERNAME} every {POLL_INTERVAL_SEC}s "
-            f"for '{KEYWORD}' (whole word, case-insensitive)."
+            f"for '{KEYWORD}'. Commands: /test, /lastsold [N], /help"
         )
 
-        # Optional one-shot test blast on startup. Set TEST_BLAST=1 in Railway to trigger,
-        # then DELETE the var to disable.
-        # If a recent tweet contains the KEYWORD, blast THAT real tweet (also proves the
-        # bot can read subscriber-only content). Otherwise send a notice.
-        if os.environ.get("TEST_BLAST") == "1":
-            matches = [t for t in tweets if KEYWORD_RE.search(t.get("text") or "")]
-            if matches:
-                matches.sort(key=lambda t: int(t["id"]), reverse=True)
-                m = matches[0]
-                tweet_url = f"https://x.com/{TARGET_USERNAME}/status/{m['id']}"
-                full_msg = (
-                    f"🧪 TEST BLAST (simulated match against real tweet) 🧪\n"
-                    f"🚨 '{KEYWORD}' detected from @{TARGET_USERNAME}\n\n"
-                    f"{m['text']}\n\n{tweet_url}"
-                )
-                short_msg = f"🚨🚨 TEST {KEYWORD.upper()} — {tweet_url}"
-                log(f"TEST → blasting based on real tweet {m['id']}: {tweet_url}")
-                telegram_send(full_msg)
-                for i in range(ALARM_BLAST_COUNT - 1):
-                    telegram_send(f"{short_msg}  [{i+2}/{ALARM_BLAST_COUNT}]")
-                    time.sleep(ALARM_BLAST_DELAY)
-            else:
-                log(f"TEST → no recent tweet matching '{KEYWORD}' in last {len(tweets)} tweets")
-                telegram_send(
-                    f"🧪 TEST_BLAST=1 but no recent tweet from @{TARGET_USERNAME} contains "
-                    f"'{KEYWORD}' in the latest {len(tweets)} tweets the bot can see. "
-                    f"If you expected one (e.g. a subscriber-only tweet), the bot may not "
-                    f"have visibility — cookies might need refreshing."
-                )
-
-        consecutive_errors = 0
-
-        while True:
-            try:
-                tweets = await fetch_tweets(page, TARGET_USERNAME)
-                consecutive_errors = 0
-
-                new_tweets = [t for t in tweets if int(t["id"]) > last_seen_id]
-                new_tweets.sort(key=lambda t: int(t["id"]))
-
-                for t in new_tweets:
-                    last_seen_id = max(last_seen_id, int(t["id"]))
-                    preview = (t["text"] or "").replace("\n", " ")[:120]
-                    log(f"new tweet {t['id']}: {preview}")
-
-                    if KEYWORD_RE.search(t["text"] or ""):
-                        tweet_url = f"https://x.com/{TARGET_USERNAME}/status/{t['id']}"
-                        full_msg = (
-                            f"🚨🚨🚨 '{KEYWORD}' DETECTED FROM @{TARGET_USERNAME} 🚨🚨🚨\n\n"
-                            f"{t['text']}\n\n{tweet_url}"
-                        )
-                        short_msg = f"🚨🚨 {KEYWORD.upper()} — {tweet_url}"
-                        log(f"MATCH → blasting {ALARM_BLAST_COUNT} telegram msgs: {tweet_url}")
-                        telegram_send(full_msg)  # first one carries full context
-                        for i in range(ALARM_BLAST_COUNT - 1):
-                            telegram_send(f"{short_msg}  [{i+2}/{ALARM_BLAST_COUNT}]")
-                            time.sleep(ALARM_BLAST_DELAY)
-            except Exception as e:
-                consecutive_errors += 1
-                log(f"poll error #{consecutive_errors}: {e!r}")
-                if consecutive_errors == 5:
-                    telegram_send(
-                        f"⚠️ Bot is hitting errors talking to X: {e!r}. Will keep retrying."
-                    )
-                if consecutive_errors >= 60:
-                    telegram_send("❌ Bot giving up after 60 consecutive errors.")
-                    sys.exit(1)
-
-            await asyncio.sleep(POLL_INTERVAL_SEC)
+        # Run both loops concurrently. If either crashes hard, the process exits.
+        await asyncio.gather(
+            polling_loop(page),
+            command_listener(page),
+        )
 
 
 if __name__ == "__main__":
