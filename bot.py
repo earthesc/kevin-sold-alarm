@@ -280,9 +280,10 @@ async def cmd_lastsold(page, n: int) -> None:
                 telegram_send(f"{m.get('text','')}\n\n{url}")
                 time.sleep(0.25)
             return
-    # Cache insufficient — do a fresh deep scrape.
+    # Cache insufficient — do a fresh deep scrape. Kevin posts roughly 1 "sold"
+    # tweet per ~15-20 tweets, so scrape ~20× N to reliably get N matches.
     telegram_send(f"📋 /lastsold {n} — scraping @{TARGET_USERNAME}'s timeline...")
-    tweets = await fetch_tweets_safe(page, TARGET_USERNAME, target_count=max(20, n * 6))
+    tweets = await fetch_tweets_safe(page, TARGET_USERNAME, target_count=max(30, n * 20))
     matches = find_matches(tweets)[:n]
     if not matches:
         telegram_send(
