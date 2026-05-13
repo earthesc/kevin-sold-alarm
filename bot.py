@@ -77,19 +77,35 @@ def log(msg: str) -> None:
 
 
 def telegram_send(text: str) -> None:
-    """POST to Telegram sendMessage; logs but never raises."""
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        data = urllib.parse.urlencode({
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": text,
-            "disable_web_page_preview": "false",
-        }).encode("utf-8")
-        req = urllib.request.Request(url, data=data, method="POST")
-        with urllib.request.urlopen(req, timeout=15) as r:
-            r.read()
-    except Exception as e:
-        log(f"telegram send error: {e!r}")
+    """POST to Telegram sendMessage. On 429 (rate limit), honour retry_after and
+    retry once. Logs but never raises."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    data = urllib.parse.urlencode({
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "disable_web_page_preview": "false",
+    }).encode("utf-8")
+    for attempt in range(2):
+        try:
+            req = urllib.request.Request(url, data=data, method="POST")
+            with urllib.request.urlopen(req, timeout=15) as r:
+                r.read()
+            return
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                try:
+                    body = json.loads(e.read())
+                    wait = int(body.get("parameters", {}).get("retry_after", 5))
+                except Exception:
+                    wait = 5
+                log(f"telegram 429: sleeping {wait}s then retrying")
+                time.sleep(wait + 1)
+                continue
+            log(f"telegram send error: {e!r}")
+            return
+        except Exception as e:
+            log(f"telegram send error: {e!r}")
+            return
 
 
 def telegram_get_updates_sync(offset: int, timeout: int = 25):
@@ -322,12 +338,25 @@ async def cmd_help() -> None:
 
 async def polling_loop(page) -> None:
     global last_poll_tweets, last_poll_ts
-    tweets = await fetch_tweets_safe(page, TARGET_USERNAME)
-    if tweets:
-        last_poll_tweets = tweets
-        last_poll_ts = time.time()
-    last_seen_id = max((int(t["id"]) for t in tweets), default=0)
-    log(f"poll seed: last_seen_id={last_seen_id}, scanning every {POLL_INTERVAL_SEC}s")
+
+    # CRITICAL: never enter the alert loop without a real seed. If we did, a
+    # last_seen_id of 0 would treat ALL of Kevin's history as "new" and the bot
+    # would blast every historical keyword match. Keep retrying the seed fetch
+    # (respecting throttle backoff) until we get tweets.
+    last_seen_id = 0
+    seed_attempt = 0
+    while last_seen_id == 0:
+        seed_attempt += 1
+        tweets = await fetch_tweets_safe(page, TARGET_USERNAME)
+        if tweets:
+            last_poll_tweets = tweets
+            last_poll_ts = time.time()
+            last_seen_id = max(int(t["id"]) for t in tweets)
+            log(f"poll seed (attempt {seed_attempt}): last_seen_id={last_seen_id}")
+            break
+        log(f"seed attempt {seed_attempt} returned 0 tweets; retrying after {POLL_INTERVAL_SEC}s")
+        await asyncio.sleep(POLL_INTERVAL_SEC)
+    log(f"poll loop starting, scanning every {POLL_INTERVAL_SEC}s")
 
     consecutive_errors = 0
     consecutive_empty = 0
