@@ -181,7 +181,9 @@ def blast_for_tweet(t: dict, label_prefix: str = "") -> None:
 
 async def cmd_test(page) -> None:
     telegram_send("🧪 /test — fetching recent tweets...")
-    tweets = await fetch_tweets_safe(page, TARGET_USERNAME)
+    # Scrape ~30 tweets so /test reliably finds a recent match even if it's not in
+    # the first DOM snapshot (Kevin's "sold" tweets aren't always at the top).
+    tweets = await fetch_tweets_safe(page, TARGET_USERNAME, target_count=30)
     matches = find_matches(tweets)
     if not matches:
         telegram_send(
@@ -221,7 +223,7 @@ async def cmd_help() -> None:
         f"/test  — fire a simulated alarm using @{TARGET_USERNAME}'s most recent "
         f"'{KEYWORD}' tweet\n"
         f"/lastsold  — show the single most recent '{KEYWORD}' tweet\n"
-        f"/lastsold N  — show the last N matching tweets (max 20)\n"
+        f"/lastsold N  — show the last N matching tweets (max 100)\n"
         f"/help  — this list"
     )
 
@@ -234,10 +236,31 @@ async def polling_loop(page) -> None:
     log(f"poll seed: last_seen_id={last_seen_id}, scanning every {POLL_INTERVAL_SEC}s")
 
     consecutive_errors = 0
+    consecutive_empty = 0
+    alerted_empty = False
     while True:
         try:
             tweets = await fetch_tweets_safe(page, TARGET_USERNAME)
             consecutive_errors = 0
+
+            # Silent-failure detection: 0 tweets returned probably means cookies
+            # expired / X served a login wall / account locked.
+            if not tweets:
+                consecutive_empty += 1
+                if consecutive_empty == 5 and not alerted_empty:
+                    telegram_send(
+                        "⚠️ Bot can't read any tweets from X. Most likely your "
+                        "X_AUTH_TOKEN or X_CT0 cookies expired or @peptidemaxer "
+                        "got a verification challenge. Log into x.com in your "
+                        "browser, do any challenges, copy fresh auth_token + ct0 "
+                        "cookies into Railway."
+                    )
+                    alerted_empty = True
+            else:
+                if alerted_empty:
+                    telegram_send("✅ Bot is reading tweets again.")
+                consecutive_empty = 0
+                alerted_empty = False
 
             new_tweets = [t for t in tweets if int(t["id"]) > last_seen_id]
             new_tweets.sort(key=lambda t: int(t["id"]))
