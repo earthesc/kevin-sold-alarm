@@ -108,8 +108,8 @@ JS_EXTRACT_TWEETS = """
 async def fetch_tweets(page, username: str, target_count: int = 0):
     """
     Reload the profile page and extract visible tweets as [{id, text}, ...].
-    If target_count > 0, scroll the page until at least that many tweets are
-    loaded (or scrolling stops yielding new ones).
+    If target_count > 0, scroll and ACCUMULATE tweets across scrolls (X virtualises
+    the DOM so old tweets disappear as you scroll). Dedupes by tweet id.
     """
     await page.goto(
         f"https://x.com/{username}",
@@ -122,26 +122,33 @@ async def fetch_tweets(page, username: str, target_count: int = 0):
         log("warning: no tweet articles appeared within 20s")
     await asyncio.sleep(1.2)
 
-    tweets = await page.evaluate(JS_EXTRACT_TWEETS)
-    if target_count <= len(tweets):
-        return tweets
+    seen: dict[str, dict] = {}
 
-    last_count = len(tweets)
+    def merge(batch):
+        for t in batch:
+            if t.get("id"):
+                seen[t["id"]] = t
+
+    merge(await page.evaluate(JS_EXTRACT_TWEETS))
+    if target_count <= len(seen):
+        return list(seen.values())
+
+    last_count = len(seen)
     stable = 0
     for _ in range(40):  # up to 40 scrolls
         await page.evaluate("window.scrollBy(0, 2500)")
         await asyncio.sleep(1.0)
-        tweets = await page.evaluate(JS_EXTRACT_TWEETS)
-        if len(tweets) >= target_count:
+        merge(await page.evaluate(JS_EXTRACT_TWEETS))
+        if len(seen) >= target_count:
             break
-        if len(tweets) == last_count:
+        if len(seen) == last_count:
             stable += 1
             if stable >= 3:
                 break
         else:
             stable = 0
-            last_count = len(tweets)
-    return tweets
+            last_count = len(seen)
+    return list(seen.values())
 
 
 async def fetch_tweets_safe(page, username: str, target_count: int = 0):
