@@ -148,12 +148,33 @@ async def main() -> None:
 
         # Optional one-shot test blast on startup. Set TEST_BLAST=1 in Railway to trigger,
         # then DELETE the var to disable.
+        # If a recent tweet contains the KEYWORD, blast THAT real tweet (also proves the
+        # bot can read subscriber-only content). Otherwise send a notice.
         if os.environ.get("TEST_BLAST") == "1":
-            log(f"TEST_BLAST=1 → firing test blast of {ALARM_BLAST_COUNT} messages")
-            telegram_send(f"🧪 TEST BLAST — simulating a '{KEYWORD}' match from @{TARGET_USERNAME}")
-            for i in range(ALARM_BLAST_COUNT - 1):
-                telegram_send(f"🚨🚨 TEST {KEYWORD.upper()}  [{i+2}/{ALARM_BLAST_COUNT}]")
-                time.sleep(ALARM_BLAST_DELAY)
+            matches = [t for t in tweets if KEYWORD_RE.search(t.get("text") or "")]
+            if matches:
+                matches.sort(key=lambda t: int(t["id"]), reverse=True)
+                m = matches[0]
+                tweet_url = f"https://x.com/{TARGET_USERNAME}/status/{m['id']}"
+                full_msg = (
+                    f"🧪 TEST BLAST (simulated match against real tweet) 🧪\n"
+                    f"🚨 '{KEYWORD}' detected from @{TARGET_USERNAME}\n\n"
+                    f"{m['text']}\n\n{tweet_url}"
+                )
+                short_msg = f"🚨🚨 TEST {KEYWORD.upper()} — {tweet_url}"
+                log(f"TEST → blasting based on real tweet {m['id']}: {tweet_url}")
+                telegram_send(full_msg)
+                for i in range(ALARM_BLAST_COUNT - 1):
+                    telegram_send(f"{short_msg}  [{i+2}/{ALARM_BLAST_COUNT}]")
+                    time.sleep(ALARM_BLAST_DELAY)
+            else:
+                log(f"TEST → no recent tweet matching '{KEYWORD}' in last {len(tweets)} tweets")
+                telegram_send(
+                    f"🧪 TEST_BLAST=1 but no recent tweet from @{TARGET_USERNAME} contains "
+                    f"'{KEYWORD}' in the latest {len(tweets)} tweets the bot can see. "
+                    f"If you expected one (e.g. a subscriber-only tweet), the bot may not "
+                    f"have visibility — cookies might need refreshing."
+                )
 
         consecutive_errors = 0
 
