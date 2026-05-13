@@ -233,13 +233,14 @@ def blast_for_tweet(t: dict, label_prefix: str = "") -> None:
 # ---------------------- command handlers ----------------------
 
 async def cmd_test(page) -> None:
-    # Prefer the polling-loop cache to avoid piling extra fetches on top of polls.
+    # Prefer the polling-loop cache, BUT only if it has enough tweets to be
+    # meaningful — otherwise fall back to a fresh deep fetch.
     age = time.time() - last_poll_ts
-    if last_poll_tweets and age < CACHE_MAX_AGE_SEC:
+    if last_poll_tweets and age < CACHE_MAX_AGE_SEC and len(last_poll_tweets) >= 15:
         telegram_send(f"🧪 /test — using last poll ({int(age)}s old, {len(last_poll_tweets)} tweets)")
         tweets = last_poll_tweets
     else:
-        telegram_send("🧪 /test — cache stale, fetching fresh...")
+        telegram_send("🧪 /test — fetching fresh (cache too small or stale)...")
         tweets = await fetch_tweets_safe(page, TARGET_USERNAME, target_count=30)
     matches = find_matches(tweets)
     if not matches:
