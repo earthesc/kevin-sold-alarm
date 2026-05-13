@@ -110,7 +110,16 @@ async def fetch_tweets(page, username: str, target_count: int = 0):
     Reload the profile page and extract visible tweets as [{id, text}, ...].
     If target_count > 0, scroll and ACCUMULATE tweets across scrolls (X virtualises
     the DOM so old tweets disappear as you scroll). Dedupes by tweet id.
+    On empty result, logs a diagnostic dump (URL, title, body snippet) so we can
+    see what X actually served instead of a timeline.
     """
+    seen: dict[str, dict] = {}
+
+    def merge(batch):
+        for t in batch:
+            if t.get("id"):
+                seen[t["id"]] = t
+
     await page.goto(
         f"https://x.com/{username}",
         wait_until="domcontentloaded",
@@ -119,17 +128,27 @@ async def fetch_tweets(page, username: str, target_count: int = 0):
     try:
         await page.wait_for_selector('article[data-testid="tweet"]', timeout=20000)
     except PWTimeout:
-        log("warning: no tweet articles appeared within 20s")
-    await asyncio.sleep(1.2)
-
-    seen: dict[str, dict] = {}
-
-    def merge(batch):
-        for t in batch:
-            if t.get("id"):
-                seen[t["id"]] = t
-
+        log("selector 'article[data-testid=tweet]' did not appear within 20s")
+    await asyncio.sleep(1.5)
     merge(await page.evaluate(JS_EXTRACT_TWEETS))
+
+    if not seen:
+        # Diagnostic dump — find out what X actually served when we got 0 tweets.
+        try:
+            current_url = page.url
+            title = await page.title()
+            body_snip = await page.evaluate(
+                "() => (document.body && document.body.innerText || '').slice(0, 500)"
+            )
+            log(
+                f"EMPTY FETCH DIAGNOSTIC | "
+                f"requested=https://x.com/{username} | "
+                f"actual_url={current_url} | "
+                f"title={title!r} | "
+                f"body[:500]={body_snip!r}"
+            )
+        except Exception as e:
+            log(f"diagnostic dump failed: {e!r}")
     if target_count <= len(seen):
         return list(seen.values())
 
